@@ -7,8 +7,12 @@ class Character:
 
     def __init__(self, agent_id: str) -> None:
         # Validate using public canonical values and retain your own state.
-        raise NotImplementedError("TODO Character: implement __init__ and agent_id")
+        if not isinstance(agent_id, str):
+            raise TypeError("agent_id must be a string")
+        if agent_id == "" or agent_id != agent_id.strip():
+            raise ValueError("agent_id must be nonempty and trimmed")
+        self._agent_id = agent_id
 
     @property
     def agent_id(self) -> str:
-        raise NotImplementedError("TODO Character.agent_id")
+         return self._agent_id
