@@ -14,6 +14,7 @@ import time
 import urllib.request
 import uuid
 
+
 PYTHON_VERSION = "3.12.14"
 PILLOW_VERSION = "12.3.0"
 OWNER = {"format": "ultra-project-setup-owned", "version": 1}
