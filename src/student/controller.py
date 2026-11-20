@@ -1,235 +1,162 @@
-"""TODO: generate canonical terrain deterministically from specification and seed."""
-from src.api import Terrain, TerrainGenerationSpec
-import random
-from src.api import GenerationFailure, TerrainTopology
+from src.api import Position, WorldAction, WorldActionType, WorldSnapshot
 
-DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+MOVES = {
+    WorldActionType.MOVE_NORTH: (-1, 0),
+    WorldActionType.MOVE_SOUTH: (1, 0),
+    WorldActionType.MOVE_WEST: (0, -1),
+    WorldActionType.MOVE_EAST: (0, 1),
+}
 
 
-class TerrainGenerator:
-    """Keep state local; identical inputs must also agree across fresh instances."""
+class AgentController:
+    """A new controller is constructed for each run; arrival still needs EXIT."""
 
     def __init__(self) -> None:
-        # Nothing is stored between calls, so every instance gives the same answers.
-        pass
+        self._actions = []          # the actions we still plan to take
 
-    def generate_terrain(self, specification: TerrainGenerationSpec, seed: int) -> Terrain:
-        rng = random.Random(seed)
-        rows = specification.rows
-        columns = specification.columns
-        low = specification.min_open_tiles
-        high = specification.max_open_tiles
-        topology = specification.topology
+    def choose_action(self, state: WorldSnapshot, agent_id: str) -> WorldAction:
+        if not self._actions:
+            self._actions = find_best_actions(state)
 
-        # Try several random draws; the first one that fits is used.
-        for attempt in range(300):
-            cells = self.__makeCells(rng, topology, rows, columns, low, high)
+        if self._actions:
+            return self._actions.pop(0)
 
-            if cells is not None:
-                return self.__toTerrain(cells, rows, columns)
+        # No way to finish was found: do something legal instead of crashing.
+        if WorldActionType.WAIT in state.allowed_actions:
+            return WorldAction.wait()
+        return WorldAction(WorldActionType.EXIT)
 
-        raise GenerationFailure("TerrainGenerator", "no terrain fits the specification")
 
-    # ------------------------------------------------- choose the shape
-    def __makeCells(self, rng, topology, rows, columns, low, high):
-        if topology == TerrainTopology.STRAIGHT_PATH:
-            return self.__makeStraight(rng, rows, columns, low, high)
-        if topology == TerrainTopology.BENT_PATH:
-            return self.__makeBent(rng, rows, columns, low, high)
-        if topology == TerrainTopology.BRANCHING_TREE:
-            return self.__makeTree(rng, rows, columns, low, high)
-        return self.__makeGeneral(rng, rows, columns, low, high)
+def patrol_tiles(level, turn):
+    """The tiles patrol enemies stand on at this turn."""
+    tiles = []
+    for patrol in level.patrols:
+        place = patrol.positions[(patrol.initial_phase + turn) % patrol.period]
+        tiles.append((place.row, place.column))
+    return tiles
 
-    # ---------------------------------------------------------- helpers
-    def __toTerrain(self, cells, rows, columns):
-        # Open cells become "." and everything else becomes "#".
-        lines = []
-        for r in range(rows):
-            line = ""
-            for c in range(columns):
-                if (r, c) in cells:
-                    line = line + "."
-                else:
-                    line = line + "#"
-            lines.append(line)
-        return Terrain(tuple(lines))
 
-    def __neighbors(self, cell, rows, columns):
-        # The cells above, below, left and right of this cell that are inside the grid.
-        result = []
-        for dr, dc in DIRECTIONS:
-            newRow = cell[0] + dr
-            newColumn = cell[1] + dc
-            if 0 <= newRow < rows and 0 <= newColumn < columns:
-                result.append((newRow, newColumn))
-        return result
+def legal_choices(state, enemies, situation, turn):
+    """Every legal action from a situation at a given turn.
 
-    def __countTouching(self, cell, group, rows, columns):
-        # How many neighbors of this cell are already inside the group.
-        count = 0
-        for neighbor in self.__neighbors(cell, rows, columns):
-            if neighbor in group:
-                count = count + 1
-        return count
+    Each choice is (action, new_row, new_column, new_collected, new_defeated, extra_cost).
+    """
+    row, column, collected, defeated, _ = situation
+    level = state.level
+    allowed = state.allowed_actions
+    choices = []
 
-    def __pickSize(self, rng, low, high, biggest, smallest):
-        # A random size between low and high, kept between smallest and biggest.
-        low = max(low, smallest)
-        high = min(high, biggest)
-        if low > high:
-            return None
-        return rng.randint(low, high)
+    # Tiles we cannot walk onto: enemies not yet cleared, and patrols right now.
+    blocked = patrol_tiles(level, turn)
+    for enemy in enemies:
+        if enemy.enemy_id not in defeated:
+            blocked.append((enemy.position.row, enemy.position.column))
 
-    def __findOptions(self, cells, rows, columns, avoidLoops):
-        # Every empty cell next to the shape that could be added to it.
-        # With avoidLoops, a cell is allowed only if it touches exactly one shape cell.
-        options = []
-        for cell in sorted(cells):
-            for neighbor in self.__neighbors(cell, rows, columns):
-                if neighbor in cells or neighbor in options:
-                    continue
-                if avoidLoops and self.__countTouching(neighbor, cells, rows, columns) != 1:
-                    continue
-                options.append(neighbor)
-        return options
+    # Walking.
+    for kind, (d_row, d_col) in MOVES.items():
+        tile = (row + d_row, column + d_col)
+        if kind in allowed and state.is_traversable(Position(*tile)) and tile not in blocked:
+            choices.append((WorldAction(kind), tile[0], tile[1], collected, defeated, 0))
 
-    # --------------------------------------------------- straight path
-    def __makeStraight(self, rng, rows, columns, low, high):
-        directions = []
-        if columns >= 2:
-            directions.append("row")
-        if rows >= 2:
-            directions.append("column")
-        if len(directions) == 0:
-            return None
+    # Waiting (only useful when patrols move around).
+    if level.patrols and WorldActionType.WAIT in allowed:
+        choices.append((WorldAction.wait(), row, column, collected, defeated, 0))
 
-        direction = rng.choice(directions)
-        if direction == "row":
-            length = columns
-        else:
-            length = rows
+    # Collecting an artifact on our tile.
+    if WorldActionType.COLLECT in allowed:
+        for artifact in level.artifacts:
+            here = (artifact.position.row, artifact.position.column) == (row, column)
+            if here and artifact.artifact_id not in collected:
+                action = WorldAction(WorldActionType.COLLECT, target_id=artifact.artifact_id)
+                new_collected = tuple(sorted(collected + (artifact.artifact_id,)))
+                choices.append((action, row, column, new_collected, defeated, 0))
 
-        size = self.__pickSize(rng, low, high, length, 2)
-        if size is None:
-            return None
+    # Engaging an enemy on a neighbouring tile (costs its penalty).
+    if WorldActionType.ENGAGE in allowed:
+        for enemy in enemies:
+            distance = abs(enemy.position.row - row) + abs(enemy.position.column - column)
+            if distance == 1 and enemy.enemy_id not in defeated:
+                action = WorldAction(WorldActionType.ENGAGE, target_id=enemy.enemy_id)
+                new_defeated = tuple(sorted(defeated + (enemy.enemy_id,)))
+                choices.append((action, row, column, collected, new_defeated, enemy.encounter_penalty))
 
-        cells = set()
-        if direction == "row":
-            row = rng.randrange(rows)
-            start = rng.randrange(columns - size + 1)
-            for i in range(size):
-                cells.add((row, start + i))
-        else:
-            column = rng.randrange(columns)
-            start = rng.randrange(rows - size + 1)
-            for i in range(size):
-                cells.add((start + i, column))
-        return cells
+    return choices
 
-    # -------------------------------------------------------- bent path
-    def __makeBent(self, rng, rows, columns, low, high):
-        if rows < 2 or columns < 2:
-            return None
-        size = self.__pickSize(rng, low, high, rows * columns, 3)
-        if size is None:
-            return None
 
-        origin = (rng.randrange(rows), rng.randrange(columns))
-        self.__tries = 5000
-        path = self.__extendPath(rng, [origin], size, rows, columns)
-        if path is None:
-            return None
-        return set(path)
+def is_safe(state, tile, new_turn):
+    """After a non-EXIT action: is the run still alive and inside its limits?"""
+    if new_turn >= state.max_turns:
+        return False                                  # no turn left for EXIT
+    if state.deadline_turn is not None and new_turn >= state.deadline_turn:
+        return False                                  # too late
+    return tile not in patrol_tiles(state.level, new_turn)   # a patrol hits us
 
-    def __isBent(self, path):
-        # A bent path must use more than one row AND more than one column.
-        rowsUsed = set()
-        columnsUsed = set()
-        for cell in path:
-            rowsUsed.add(cell[0])
-            columnsUsed.add(cell[1])
-        return len(rowsUsed) > 1 and len(columnsUsed) > 1
 
-    def __extendPath(self, rng, path, size, rows, columns):
-        """Grow a path one cell at a time (backtracking when stuck)."""
-        if len(path) == size:
-            if self.__isBent(path):
-                return path
-            return None
+def points(state, collected, final_cost):
+    """The workbench's points: base + artifact values - rate * extra cost."""
+    reward = sum(a.value for a in state.level.artifacts if a.artifact_id in collected)
+    excess = max(0, final_cost - state.baseline_cost)
+    if excess >= state.zero_score_excess:
+        return 0
+    return max(0, state.base_points + reward - state.deduction_rate * excess)
 
-        self.__tries = self.__tries - 1
-        if self.__tries <= 0:
-            return None
 
-        tail = path[-1]
-        options = self.__neighbors(tail, rows, columns)
-        rng.shuffle(options)
-        for cell in options:
-            if cell in path:
+def find_best_actions(state):
+    """Return the list of actions of the best route (empty if there is none)."""
+    level = state.level
+    exit_tile = (level.exit.row, level.exit.column)
+    patrol_ids = [patrol.enemy_id for patrol in level.patrols]
+    enemies = [e for e in level.enemies if e.enemy_id not in patrol_ids]
+
+    # Cost so far = turns used + penalties already paid.
+    paid = sum(e.encounter_penalty for e in enemies if e.enemy_id in state.defeated_enemy_ids)
+    # A situation is (row, column, collected, defeated, turn). The turn only matters
+    # when patrols move, so without patrols we store 0 to keep the search small.
+    has_patrols = len(level.patrols) > 0
+    start = (state.agent_position.row, state.agent_position.column,
+             state.collected_artifact_ids, state.defeated_enemy_ids,
+             state.turn if has_patrols else 0)
+    start_cost = state.turn + paid
+
+    cheapest = {start: start_cost}      # situation -> lowest cost found so far
+    came_from = {}                      # situation -> (previous situation, action)
+    to_explore = [(start_cost, state.turn, start)]  # (cost, real turn, situation)
+    best_finish = None                  # (points, -cost, situation)
+
+    while to_explore:
+        item = min(to_explore)          # the cheapest situation
+        to_explore.remove(item)
+        cost, turn, situation = item
+        row, column, collected, defeated, _ = situation
+
+        # On the exit: EXIT is one more action, and then the run is over.
+        if (row, column) == exit_tile and WorldActionType.EXIT in state.allowed_actions:
+            finish = (points(state, collected, cost + 1), -(cost + 1), situation)
+            if best_finish is None or finish[:2] > best_finish[:2]:
+                best_finish = finish
+
+        for action, new_row, new_col, new_collected, new_defeated, extra in \
+                legal_choices(state, enemies, situation, turn):
+            if not is_safe(state, (new_row, new_col), turn + 1):
                 continue
-            # The new cell may touch only the tail, otherwise the path would not be a simple line.
-            if self.__countTouching(cell, path, rows, columns) != 1:
-                continue
+            new_situation = (new_row, new_col, new_collected, new_defeated,
+                             turn + 1 if has_patrols else 0)
+            new_cost = cost + 1 + extra
+            if new_situation not in cheapest or new_cost < cheapest[new_situation]:
+                if new_situation in cheapest:
+                    to_explore = [x for x in to_explore if x[2] != new_situation]
+                cheapest[new_situation] = new_cost
+                came_from[new_situation] = (situation, action)
+                to_explore.append((new_cost, turn + 1, new_situation))
 
-            path.append(cell)
-            found = self.__extendPath(rng, path, size, rows, columns)
-            if found is not None:
-                return found
-            path.pop()
-        return None
+    if best_finish is None:
+        return []
 
-    # ---------------------------------------------------- branching tree
-    def __makeTree(self, rng, rows, columns, low, high):
-        bigEnough = (rows >= 2 and columns >= 3) or (rows >= 3 and columns >= 2)
-        if not bigEnough:
-            return None
-        size = self.__pickSize(rng, low, high, rows * columns, 4)
-        if size is None:
-            return None
-
-        cells = set()
-        cells.add((rng.randrange(rows), rng.randrange(columns)))
-
-        while len(cells) < size:
-            options = self.__findOptions(cells, rows, columns, True)
-            if len(options) == 0:
-                return None
-            cells.add(rng.choice(options))
-
-        if self.__hasJunction(cells, rows, columns):
-            return cells
-        return None
-
-    def __hasJunction(self, cells, rows, columns):
-        # A real tree here must have at least one junction (3 or more neighbors).
-        for cell in cells:
-            if self.__countTouching(cell, cells, rows, columns) >= 3:
-                return True
-        return False
-
-    # ------------------------------------------------------------ general
-    def __makeGeneral(self, rng, rows, columns, low, high):
-        size = self.__pickSize(rng, low, high, rows * columns, 0)
-        if size is None:
-            return None
-        if size == 0:
-            return set()
-
-        cells = set()
-        if size >= 4 and rows >= 2 and columns >= 2:
-            # Start with a 2x2 block so the map always contains a loop.
-            r = rng.randrange(rows - 1)
-            c = rng.randrange(columns - 1)
-            cells.add((r, c))
-            cells.add((r + 1, c))
-            cells.add((r, c + 1))
-            cells.add((r + 1, c + 1))
-        else:
-            cells.add((rng.randrange(rows), rng.randrange(columns)))
-
-        while len(cells) < size:
-            options = self.__findOptions(cells, rows, columns, False)
-            if len(options) == 0:
-                return None
-            cells.add(rng.choice(options))
-        return cells
+    # Walk backwards from the best finish to the start to get the actions.
+    actions = [WorldAction(WorldActionType.EXIT)]
+    situation = best_finish[2]
+    while situation in came_from:
+        situation, action = came_from[situation]
+        actions.append(action)
+    actions.reverse()
+    return actions

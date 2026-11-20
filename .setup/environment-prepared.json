@@ -1,0 +1,54 @@
+{
+  "base_interpreter": "C:\\Users\\USER\\Desktop\\SCHOOL\\DSA_Adventure-Student\\.setup-payload\\python\\python.exe",
+  "bundled_payload_manifest_sha256": "9b92bae28aa0ec565264c588a7b45b5cf3b9965e3c5551c1496c4135b02a44be",
+  "direct_bundled_launcher_files": {
+    "python.exe": {
+      "bytes": 91648,
+      "sha256": "035edd396262c1a26beb6b0760398ca05bbe5c815a6e8a2f2c624fd64e3a3b13"
+    },
+    "python3.dll": {
+      "bytes": 56320,
+      "sha256": "77a86084478984210c4be0bf37e1085e16ade173378ec8fe96fe54b7e8511a1c"
+    },
+    "python312.dll": {
+      "bytes": 6970368,
+      "sha256": "dfb8d556a009dc55d13ebff74b6f8e891a6ad3c9aee476e26f41c86df8258931"
+    },
+    "pythonw.exe": {
+      "bytes": 90112,
+      "sha256": "0e69ecdb125065f79460d240e6b22f495c4ef6d3e0f9ab63f472eb8764d3b764"
+    },
+    "vcruntime140.dll": {
+      "bytes": 124544,
+      "sha256": "d5e4d9a3e835fa679450145d6a7d94e36573a509317111904d9b3712c30d9066"
+    },
+    "vcruntime140_1.dll": {
+      "bytes": 49792,
+      "sha256": "1f2d41c4aa5db0bc33ebf7b66d72943a817d7ce6cbe880502a9403823633093f"
+    }
+  },
+  "format": "ultra-project-environment",
+  "interpreter": ".venv/Scripts/python.exe",
+  "lock_sha256": "df5c34ee738a12844418596d468567561a3c7096a24c1abc266e07949715dd08",
+  "project_root": "C:\\Users\\USER\\Desktop\\SCHOOL\\DSA_Adventure-Student",
+  "python": {
+    "base_prefix": "C:\\Users\\USER\\Desktop\\SCHOOL\\DSA_Adventure-Student\\.setup-payload\\python",
+    "bits": 64,
+    "elevated": false,
+    "executable": "C:\\Users\\USER\\Desktop\\SCHOOL\\DSA_Adventure-Student\\.venv\\Scripts\\python.exe",
+    "implementation": "CPython",
+    "pillow": "12.3.0",
+    "platform": "win32",
+    "tk_import": 8.6,
+    "version": "3.12.14"
+  },
+  "ready": true,
+  "status": "READY",
+  "student_code_executed": false,
+  "version": 1,
+  "window_check": {
+    "tcl": "8.6.12",
+    "tk": "8.6.12",
+    "window_created": true
+  }
+}
