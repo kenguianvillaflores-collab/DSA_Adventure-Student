@@ -1,235 +1,125 @@
 """TODO: generate canonical terrain deterministically from specification and seed."""
-from src.api import Terrain, TerrainGenerationSpec
 import random
-from src.api import GenerationFailure, TerrainTopology
 
-DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+from src.api import GenerationFailure, Terrain, TerrainGenerationSpec, TerrainTopology
+
+DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
 
 
 class TerrainGenerator:
     """Keep state local; identical inputs must also agree across fresh instances."""
 
     def __init__(self) -> None:
-        # Nothing is stored between calls, so every instance gives the same answers.
+        # Nothing to remember: every call makes its own random generator.
         pass
 
     def generate_terrain(self, specification: TerrainGenerationSpec, seed: int) -> Terrain:
         rng = random.Random(seed)
-        rows = specification.rows
-        columns = specification.columns
-        low = specification.min_open_tiles
-        high = specification.max_open_tiles
-        topology = specification.topology
+        rows, columns = specification.rows, specification.columns
+        count = rng.randint(specification.min_open_tiles, specification.max_open_tiles)
 
-        # Try several random draws; the first one that fits is used.
-        for attempt in range(300):
-            cells = self.__makeCells(rng, topology, rows, columns, low, high)
-
-            if cells is not None:
-                return self.__toTerrain(cells, rows, columns)
-
-        raise GenerationFailure("TerrainGenerator", "no terrain fits the specification")
-
-    # ------------------------------------------------- choose the shape
-    def __makeCells(self, rng, topology, rows, columns, low, high):
-        if topology == TerrainTopology.STRAIGHT_PATH:
-            return self.__makeStraight(rng, rows, columns, low, high)
-        if topology == TerrainTopology.BENT_PATH:
-            return self.__makeBent(rng, rows, columns, low, high)
-        if topology == TerrainTopology.BRANCHING_TREE:
-            return self.__makeTree(rng, rows, columns, low, high)
-        return self.__makeGeneral(rng, rows, columns, low, high)
-
-    # ---------------------------------------------------------- helpers
-    def __toTerrain(self, cells, rows, columns):
-        # Open cells become "." and everything else becomes "#".
-        lines = []
-        for r in range(rows):
-            line = ""
-            for c in range(columns):
-                if (r, c) in cells:
-                    line = line + "."
-                else:
-                    line = line + "#"
-            lines.append(line)
-        return Terrain(tuple(lines))
-
-    def __neighbors(self, cell, rows, columns):
-        # The cells above, below, left and right of this cell that are inside the grid.
-        result = []
-        for dr, dc in DIRECTIONS:
-            newRow = cell[0] + dr
-            newColumn = cell[1] + dc
-            if 0 <= newRow < rows and 0 <= newColumn < columns:
-                result.append((newRow, newColumn))
-        return result
-
-    def __countTouching(self, cell, group, rows, columns):
-        # How many neighbors of this cell are already inside the group.
-        count = 0
-        for neighbor in self.__neighbors(cell, rows, columns):
-            if neighbor in group:
-                count = count + 1
-        return count
-
-    def __pickSize(self, rng, low, high, biggest, smallest):
-        # A random size between low and high, kept between smallest and biggest.
-        low = max(low, smallest)
-        high = min(high, biggest)
-        if low > high:
-            return None
-        return rng.randint(low, high)
-
-    def __findOptions(self, cells, rows, columns, avoidLoops):
-        # Every empty cell next to the shape that could be added to it.
-        # With avoidLoops, a cell is allowed only if it touches exactly one shape cell.
-        options = []
-        for cell in sorted(cells):
-            for neighbor in self.__neighbors(cell, rows, columns):
-                if neighbor in cells or neighbor in options:
-                    continue
-                if avoidLoops and self.__countTouching(neighbor, cells, rows, columns) != 1:
-                    continue
-                options.append(neighbor)
-        return options
-
-    # --------------------------------------------------- straight path
-    def __makeStraight(self, rng, rows, columns, low, high):
-        directions = []
-        if columns >= 2:
-            directions.append("row")
-        if rows >= 2:
-            directions.append("column")
-        if len(directions) == 0:
-            return None
-
-        direction = rng.choice(directions)
-        if direction == "row":
-            length = columns
+        if specification.topology is TerrainTopology.STRAIGHT_PATH:
+            floor = _straight_path(rows, columns, count, rng)
+        elif specification.topology is TerrainTopology.BENT_PATH:
+            floor = _bent_path(rows, columns, count, rng)
+        elif specification.topology is TerrainTopology.BRANCHING_TREE:
+            floor = _branching_tree(rows, columns, count, rng)
         else:
-            length = rows
+            floor = _general_shape(rows, columns, count, rng)
 
-        size = self.__pickSize(rng, low, high, length, 2)
-        if size is None:
-            return None
+        return Terrain(tuple(
+            "".join("." if (row, column) in floor else "#" for column in range(columns))
+            for row in range(rows)
+        ))
 
-        cells = set()
-        if direction == "row":
-            row = rng.randrange(rows)
-            start = rng.randrange(columns - size + 1)
-            for i in range(size):
-                cells.add((row, start + i))
-        else:
-            column = rng.randrange(columns)
-            start = rng.randrange(rows - size + 1)
-            for i in range(size):
-                cells.add((start + i, column))
-        return cells
 
-    # -------------------------------------------------------- bent path
-    def __makeBent(self, rng, rows, columns, low, high):
-        if rows < 2 or columns < 2:
-            return None
-        size = self.__pickSize(rng, low, high, rows * columns, 3)
-        if size is None:
-            return None
+def _fail(reason: str) -> GenerationFailure:
+    return GenerationFailure("TerrainGenerator", reason)
 
-        origin = (rng.randrange(rows), rng.randrange(columns))
-        self.__tries = 5000
-        path = self.__extendPath(rng, [origin], size, rows, columns)
-        if path is None:
-            return None
-        return set(path)
 
-    def __isBent(self, path):
-        # A bent path must use more than one row AND more than one column.
-        rowsUsed = set()
-        columnsUsed = set()
-        for cell in path:
-            rowsUsed.add(cell[0])
-            columnsUsed.add(cell[1])
-        return len(rowsUsed) > 1 and len(columnsUsed) > 1
+def _straight_path(rows, columns, count, rng):
+    """One line of floor, either across a row or down a column."""
+    fits_across = count <= columns
+    fits_down = count <= rows
+    if count < 2 or not (fits_across or fits_down):
+        raise _fail("a straight path of this length does not fit the board")
+    if fits_across and fits_down:
+        across = rng.choice([True, False])
+    else:
+        across = fits_across
 
-    def __extendPath(self, rng, path, size, rows, columns):
-        """Grow a path one cell at a time (backtracking when stuck)."""
-        if len(path) == size:
-            if self.__isBent(path):
-                return path
-            return None
+    if across:
+        row = rng.randrange(rows)
+        first = rng.randrange(columns - count + 1)
+        return {(row, first + i) for i in range(count)}
+    column = rng.randrange(columns)
+    first = rng.randrange(rows - count + 1)
+    return {(first + i, column) for i in range(count)}
 
-        self.__tries = self.__tries - 1
-        if self.__tries <= 0:
-            return None
 
-        tail = path[-1]
-        options = self.__neighbors(tail, rows, columns)
-        rng.shuffle(options)
-        for cell in options:
-            if cell in path:
-                continue
-            # The new cell may touch only the tail, otherwise the path would not be a simple line.
-            if self.__countTouching(cell, path, rows, columns) != 1:
-                continue
+def _bent_path(rows, columns, count, rng):
+    """An 'L': an arm along the top or bottom row, then one turn up or down."""
+    # Every way to split `count` tiles into a horizontal arm and a vertical arm.
+    shapes = [(arm, count - arm) for arm in range(2, columns + 1)
+              if 1 <= count - arm <= rows - 1]
+    if not shapes:
+        raise _fail("a bent path of this length does not fit the board")
+    arm, rest = rng.choice(shapes)
 
-            path.append(cell)
-            found = self.__extendPath(rng, path, size, rows, columns)
-            if found is not None:
-                return found
-            path.pop()
-        return None
+    row = rng.choice([0, rows - 1])
+    first = rng.randrange(columns - arm + 1)
+    turn_column = rng.choice([first, first + arm - 1])   # the turn is at an end of the arm
+    step = 1 if row == 0 else -1                         # away from the edge we started on
 
-    # ---------------------------------------------------- branching tree
-    def __makeTree(self, rng, rows, columns, low, high):
-        bigEnough = (rows >= 2 and columns >= 3) or (rows >= 3 and columns >= 2)
-        if not bigEnough:
-            return None
-        size = self.__pickSize(rng, low, high, rows * columns, 4)
-        if size is None:
-            return None
+    floor = {(row, first + i) for i in range(arm)}
+    floor |= {(row + step * k, turn_column) for k in range(1, rest + 1)}
+    return floor
 
-        cells = set()
-        cells.add((rng.randrange(rows), rng.randrange(columns)))
 
-        while len(cells) < size:
-            options = self.__findOptions(cells, rows, columns, True)
-            if len(options) == 0:
-                return None
-            cells.add(rng.choice(options))
+def _branching_tree(rows, columns, count, rng):
+    """A 'comb': a spine along one edge with branches growing away from it.
 
-        if self.__hasJunction(cells, rows, columns):
-            return cells
-        return None
+    Branches sit two columns apart so they never touch, which means the floor
+    has no loops (it is a tree). At least one branch leaves from the middle of
+    the spine, so that tile has three floor neighbours (a junction).
+    """
+    spine = min(columns, count - 1)
+    if spine < 3 or rows < 2:
+        raise _fail("a branching tree of this size does not fit the board")
 
-    def __hasJunction(self, cells, rows, columns):
-        # A real tree here must have at least one junction (3 or more neighbors).
-        for cell in cells:
-            if self.__countTouching(cell, cells, rows, columns) >= 3:
-                return True
-        return False
+    branch_columns = list(range(0, spine, 2)) if spine >= 4 else [1]
+    middle_columns = [c for c in branch_columns if 0 < c < spine - 1]
+    longest = rows - 1
+    length = {c: 0 for c in branch_columns}
 
-    # ------------------------------------------------------------ general
-    def __makeGeneral(self, rng, rows, columns, low, high):
-        size = self.__pickSize(rng, low, high, rows * columns, 0)
-        if size is None:
-            return None
-        if size == 0:
-            return set()
+    length[rng.choice(middle_columns)] += 1            # guarantees a junction
+    for _ in range(count - spine - 1):                 # place the remaining tiles
+        room = [c for c in branch_columns if length[c] < longest]
+        if not room:
+            raise _fail("a branching tree of this size does not fit the board")
+        length[rng.choice(room)] += 1
 
-        cells = set()
-        if size >= 4 and rows >= 2 and columns >= 2:
-            # Start with a 2x2 block so the map always contains a loop.
-            r = rng.randrange(rows - 1)
-            c = rng.randrange(columns - 1)
-            cells.add((r, c))
-            cells.add((r + 1, c))
-            cells.add((r, c + 1))
-            cells.add((r + 1, c + 1))
-        else:
-            cells.add((rng.randrange(rows), rng.randrange(columns)))
+    first = rng.randrange(columns - spine + 1)
+    flip = rng.choice([True, False])                   # spine on the top or bottom edge
+    floor = {(0, first + i) for i in range(spine)}
+    for c, size in length.items():
+        floor |= {(k, first + c) for k in range(1, size + 1)}
+    if flip:
+        floor = {(rows - 1 - row, column) for row, column in floor}
+    return floor
 
-        while len(cells) < size:
-            options = self.__findOptions(cells, rows, columns, False)
-            if len(options) == 0:
-                return None
-            cells.add(rng.choice(options))
-        return cells
+
+def _general_shape(rows, columns, count, rng):
+    """One connected blob, grown a random neighbouring tile at a time."""
+    if count == 0:
+        return set()
+    floor = {(rng.randrange(rows), rng.randrange(columns))}
+    while len(floor) < count:
+        edge = sorted({
+            (row + dr, column + dc)
+            for row, column in floor
+            for dr, dc in DIRECTIONS
+            if 0 <= row + dr < rows and 0 <= column + dc < columns
+        } - floor)
+        floor.add(rng.choice(edge))
+    return floor

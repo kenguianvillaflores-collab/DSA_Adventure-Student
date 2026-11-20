@@ -1,219 +1,163 @@
 """TODO: build a canonical level using the injected terrain generator."""
-from src.api import LevelDefinition, LevelSpecification, TerrainGeneratorContract
+
 import random
-from src.api import GenerationFailure, Position, TerrainTopology
-from src.api import to_artifact_definition, to_character_definition, to_enemy_definition
+from collections import deque
+
+from src.api import (
+    GenerationFailure, LevelDefinition, LevelSpecification, Position, TerrainGeneratorContract,
+    TerrainTopology, to_artifact_definition, to_character_definition, to_enemy_definition,
+)
 from src.student.artifact import Artifact
 from src.student.character import Character
 from src.student.enemy import Enemy
 
-DIRECTIONS = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+DIRECTIONS = ((-1, 0), (1, 0), (0, -1), (0, 1))
+MAX_SEED = 2 ** 31 - 1
 
 
 class LevelGenerator:
     """Use the supplied TerrainGeneratorContract; do not instantiate a replacement."""
 
     def __init__(self, terrain_generator: TerrainGeneratorContract) -> None:
-        self.__terrainGenerator = terrain_generator
+        self._terrain_generator = terrain_generator
 
     def generate_level(self, specification: LevelSpecification, seed: int) -> LevelDefinition:
-        # Each attempt uses the next terrain seed (seed, seed + 1, ...) and its own random generator.
+        rng = random.Random(seed)
+
         for attempt in range(specification.max_attempts):
-            terrain = self.__terrainGenerator.generate_terrain(
-                specification.terrain_spec, seed + attempt)
-            rng = random.Random(seed * 256 + attempt)
-
-            level = self.__buildLevel(specification, seed, terrain, rng)
-            if level is not None:
-                return level
-
-        raise GenerationFailure("LevelGenerator", "no acceptable level within the attempt budget")
-
-    # ------------------------------------------------------------ main steps
-    def __buildLevel(self, specification, seed, terrain, rng):
-        # Each step returns None when this attempt is not good enough.
-        graph = self.__makeGraph(terrain)
-        if len(graph) < 2:
-            return None
-
-        if not self.__shapeIsOk(specification, graph):
-            return None
-
-        endpoints = self.__chooseEndpoints(specification, graph, rng)
-        if endpoints is None:
-            return None
-        start, goal = endpoints
-
-        entities = self.__placeEntities(specification, graph, start, goal, rng)
-        if entities is None:
-            return None
-        artifacts, enemies = entities
-
-        return LevelDefinition(
-            level_id=specification.level_id,
-            profile_id=specification.profile_id,
-            seed=seed,
-            terrain=terrain,
-            start=Position(start[0], start[1]),
-            exit=Position(goal[0], goal[1]),
-            character=to_character_definition(Character(specification.agent_id)),
-            artifacts=tuple(to_artifact_definition(a) for a in artifacts),
-            enemies=tuple(to_enemy_definition(e) for e in enemies),
-            patrols=(),
-        )
-
-    def __shapeIsOk(self, specification, graph):
-        # Enough junctions (3+ neighbors) and not too many dead ends (1 neighbor).
-        junctions = 0
-        deadEnds = 0
-        for cell in graph:
-            neighborCount = len(graph[cell])
-            if neighborCount >= 3:
-                junctions = junctions + 1
-            if neighborCount == 1:
-                deadEnds = deadEnds + 1
-        return junctions >= specification.min_branch_tiles and deadEnds <= specification.max_dead_end_tiles
-
-    # ------------------------------------------------------------ graph
-    def __makeGraph(self, terrain):
-        """Map every floor cell to the list of floor cells next to it."""
-        floor = set()
-        for r in range(terrain.rows):
-            for c in range(terrain.columns):
-                if terrain.terrain_rows[r][c] == ".":
-                    floor.add((r, c))
-
-        graph = {}
-        for cell in sorted(floor):
-            neighbors = []
-            for dr, dc in DIRECTIONS:
-                other = (cell[0] + dr, cell[1] + dc)
-                if other in floor:
-                    neighbors.append(other)
-            graph[cell] = neighbors
-        return graph
-
-    def __distances(self, graph, source, blocked=None):
-        """Breadth-first search: steps from source to every reachable cell.
-        `blocked` is one edge (a, b) that may not be used."""
-        distance = {source: 0}
-        queue = [source]
-        index = 0
-        while index < len(queue):
-            cell = queue[index]
-            index = index + 1
-            for neighbor in graph[cell]:
-                if neighbor in distance:
-                    continue
-                if blocked is not None and ((cell, neighbor) == blocked or (neighbor, cell) == blocked):
-                    continue
-                distance[neighbor] = distance[cell] + 1
-                queue.append(neighbor)
-        return distance
-
-    def __shortestRoute(self, graph, start, goal):
-        # Walk back from the goal, always stepping to a cell one step closer to the start.
-        distance = self.__distances(graph, start)
-        route = [goal]
-        current = goal
-        while current != start:
-            for neighbor in graph[current]:
-                if distance[neighbor] == distance[current] - 1:
-                    current = neighbor
-                    break
-            route.append(current)
-        return route
-
-    def __hasAlternatePath(self, graph, start, goal):
-        """True if the goal can still be reached after removing any one edge of the shortest route."""
-        route = self.__shortestRoute(graph, start, goal)
-        for i in range(len(route) - 1):
-            edge = (route[i], route[i + 1])
-            if goal in self.__distances(graph, start, edge):
-                return True
-        return False
-
-    # ------------------------------------------------------------ endpoints
-    def __chooseEndpoints(self, specification, graph, rng):
-        topology = specification.terrain_spec.topology
-        leavesOnly = topology in (TerrainTopology.STRAIGHT_PATH,
-                                  TerrainTopology.BENT_PATH,
-                                  TerrainTopology.BRANCHING_TREE)
-
-        # Path and tree maps use dead ends as endpoints; other maps allow any cell.
-        candidates = []
-        for cell in graph:
-            if not leavesOnly or len(graph[cell]) == 1:
-                candidates.append(cell)
-
-        # Group every allowed pair by the length of its shortest route.
-        pairsByLength = {}
-        for first in candidates:
-            distance = self.__distances(graph, first)
-            for second in candidates:
-                if first < second and second in distance:
-                    moves = distance[second]
-                    if specification.min_route_moves <= moves <= specification.max_route_moves:
-                        pairsByLength.setdefault(moves, []).append((first, second))
-        if len(pairsByLength) == 0:
-            return None
-
-        # Prefer the longest routes first.
-        for length in sorted(pairsByLength, reverse=True):
-            pairs = pairsByLength[length]
-            rng.shuffle(pairs)          # ties are decided by the seed
-
-            for first, second in pairs:
-                if specification.require_alternate_path and not self.__hasAlternatePath(graph, first, second):
-                    continue
-                if rng.random() < 0.5:
-                    return (first, second)
-                return (second, first)
-        return None
-
-    # ------------------------------------------------------------ entities
-    def __placeEntities(self, specification, graph, start, goal, rng):
-        artifactCells = []
-        enemyCells = []
-        for cell in sorted(graph):
-            onEndpoint = (cell == start or cell == goal)
-            if onEndpoint and not specification.allow_entities_on_endpoints:
+            # A new terrain seed for each attempt; the level keeps the original seed.
+            try:
+                terrain = self._terrain_generator.generate_terrain(
+                    specification.terrain_spec, (seed + attempt) % (MAX_SEED + 1))
+            except GenerationFailure:
                 continue
-            artifactCells.append(cell)
-            if cell != start:          # enemies may never stand on the start
-                enemyCells.append(cell)
 
-        used = []
+            floor = _floor_tiles(terrain)
+            if not _shape_is_allowed(floor, specification):
+                continue
+            endpoints = _choose_endpoints(floor, specification, rng)
+            if endpoints is None:
+                continue
+            start, exit_tile = endpoints
 
-        # Enemies are placed first, then artifacts (this order keeps the seed results the same).
-        enemies = []
-        for index in range(specification.enemy_count):
-            cell = self.__pickCell(rng, enemyCells, used, specification.allow_entity_overlap)
-            if cell is None:
+            placed = _place_entities(floor, start, exit_tile, specification, rng)
+            if placed is None:
+                continue
+            artifact_tiles, enemy_tiles = placed
+
+            artifacts = tuple(
+                to_artifact_definition(Artifact(
+                    f"artifact-{i}", Position(row, column),
+                    rng.randint(specification.artifact_value_min, specification.artifact_value_max)))
+                for i, (row, column) in enumerate(artifact_tiles))
+            enemies = tuple(
+                to_enemy_definition(Enemy(
+                    f"enemy-{i}", Position(row, column),
+                    rng.randint(specification.enemy_penalty_min, specification.enemy_penalty_max)))
+                for i, (row, column) in enumerate(enemy_tiles))
+
+            return LevelDefinition(
+                level_id=specification.level_id,
+                profile_id=specification.profile_id,
+                seed=seed,
+                terrain=terrain,
+                start=Position(*start),
+                exit=Position(*exit_tile),
+                character=to_character_definition(Character(specification.agent_id)),
+                artifacts=artifacts,
+                enemies=enemies,
+            )
+
+        raise GenerationFailure("LevelGenerator", "no acceptable level within max_attempts")
+
+
+# ---------- small helpers: the floor as a set of (row, column) tiles ----------
+
+def _floor_tiles(terrain):
+    return {(row, column)
+            for row, symbols in enumerate(terrain.terrain_rows)
+            for column, symbol in enumerate(symbols) if symbol == "."}
+
+
+def _neighbours(tile, floor):
+    row, column = tile
+    return [(row + dr, column + dc) for dr, dc in DIRECTIONS if (row + dr, column + dc) in floor]
+
+
+def _find_path(start, goal, floor, skip=None):
+    """Shortest list of tiles from start to goal (or None). `skip` removes one edge."""
+    came_from = {start: None}
+    queue = deque([start])
+    while queue:
+        here = queue.popleft()
+        if here == goal:
+            path = []
+            while here is not None:
+                path.append(here)
+                here = came_from[here]
+            return path[::-1]
+        for nxt in _neighbours(here, floor):
+            if nxt not in came_from and frozenset((here, nxt)) != skip:
+                came_from[nxt] = here
+                queue.append(nxt)
+    return None
+
+
+def _has_alternate_path(path, floor):
+    """True if blocking some single edge of the shortest path still leaves a route."""
+    start, goal = path[0], path[-1]
+    return any(_find_path(start, goal, floor, skip=frozenset(edge)) is not None
+               for edge in zip(path, path[1:]))
+
+
+# ---------- the steps of one attempt ----------
+
+def _shape_is_allowed(floor, spec):
+    junctions = sum(len(_neighbours(tile, floor)) >= 3 for tile in floor)
+    dead_ends = sum(len(_neighbours(tile, floor)) == 1 for tile in floor)
+    return junctions >= spec.min_branch_tiles and dead_ends <= spec.max_dead_end_tiles
+
+
+def _choose_endpoints(floor, spec, rng):
+    candidates = sorted(floor)
+    if spec.terrain_spec.topology is not TerrainTopology.GENERAL:
+        # Paths and trees must start and finish at a dead end (a leaf).
+        candidates = [t for t in candidates if len(_neighbours(t, floor)) == 1]
+
+    pairs = [(a, b) for a in candidates for b in candidates if a != b]
+    rng.shuffle(pairs)
+    for start, exit_tile in pairs:
+        path = _find_path(start, exit_tile, floor)
+        moves = len(path) - 1
+        if not spec.min_route_moves <= moves <= spec.max_route_moves:
+            continue
+        if spec.require_alternate_path and not _has_alternate_path(path, floor):
+            continue
+        return start, exit_tile
+    return None
+
+
+def _place_entities(floor, start, exit_tile, spec, rng):
+    """Pick tiles for the artifacts, then the enemies. Returns None if there is no room."""
+    tiles = sorted(floor)
+    artifact_ok = [t for t in tiles
+                   if spec.allow_entities_on_endpoints or t not in (start, exit_tile)]
+    enemy_ok = [t for t in artifact_ok if t != start]      # an enemy never stands on the start
+    used = set()
+
+    def pick(count, allowed):
+        chosen = []
+        for _ in range(count):
+            free = allowed if spec.allow_entity_overlap else [t for t in allowed if t not in used]
+            if not free:
                 return None
-            penalty = rng.randint(specification.enemy_penalty_min, specification.enemy_penalty_max)
-            enemies.append(Enemy(f"enemy-{index}", Position(cell[0], cell[1]), penalty))
+            tile = rng.choice(free)
+            chosen.append(tile)
+            used.add(tile)
+        return chosen
 
-        artifacts = []
-        for index in range(specification.artifact_count):
-            cell = self.__pickCell(rng, artifactCells, used, specification.allow_entity_overlap)
-            if cell is None:
-                return None
-            value = rng.randint(specification.artifact_value_min, specification.artifact_value_max)
-            artifacts.append(Artifact(f"artifact-{index}", Position(cell[0], cell[1]), value))
-
-        return (artifacts, enemies)
-
-    def __pickCell(self, rng, cells, used, overlapAllowed):
-        # Prefer a free cell; reuse a taken one only if overlap is allowed.
-        free = [cell for cell in cells if cell not in used]
-
-        if len(free) > 0:
-            choice = rng.choice(free)
-        elif overlapAllowed and len(cells) > 0:
-            choice = rng.choice(cells)
-        else:
-            return None
-
-        used.append(choice)
-        return choice
+    artifact_tiles = pick(spec.artifact_count, artifact_ok)
+    enemy_tiles = pick(spec.enemy_count, enemy_ok)
+    if artifact_tiles is None or enemy_tiles is None:
+        return None
+    return artifact_tiles, enemy_tiles
